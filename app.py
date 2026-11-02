@@ -557,6 +557,9 @@ with tabs[1]:
         st.divider()
         st.write('**Saved supplies**')
         if supplies:
+            missing_usage=[item for item in supplies if item['day_usage'] is None]
+            if missing_usage:
+                st.warning(f'{len(missing_usage)} meter(s) have no annual usage / gas AQ saved, so annual costs cannot be calculated.')
             st.dataframe(pd.DataFrame(supplies).drop(columns=['client_id','updated'],errors='ignore'),use_container_width=True,hide_index=True)
         else: st.info('No meters saved for this client yet.')
 
