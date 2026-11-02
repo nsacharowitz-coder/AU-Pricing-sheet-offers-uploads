@@ -234,30 +234,30 @@ def extract_offer_text(fname, raw):
 
 # Decline extraction suggests supplier names; the operator can review/edit before saving.
 DECLINE_SUPPLIERS = {
-    'British Gas': [r'\\bbritish\\s+gas\\b',r'@britishgas\\.co\\.uk',r'\\bBG\\b'],
-    'SSE': [r'\\bSSE\\b',r'@sse\\.com'],
-    'EDF': [r'\\bEDF\\b',r'@edfenergy\\.com'],
-    'Npower': [r'\\bnpower\\b',r'@npower\\.com'],
-    'Drax': [r'\\bdrax\\b'],
-    'SEFE': [r'\\bsefe\\b'],
-    'Shell': [r'\\bshell\\b'],
-    'Ecotricity': [r'\\becotricity\\b'],
-    'Crown': [r'\\bcrown\\s+(?:gas|energy)\\b'],
-    'Dyce': [r'\\bdyce\\b'],
-    'UGP': [r'\\bUGP\\b',r'\\butility\\s+group\\b'],
-    'TEM': [r'\\btem[- ]energy\\b'],
-    'TotalEnergies': [r'\\btotal\\s*energies\\b'],
-    'E.ON Next': [r'\\be\\.?on\\s+next\\b'],
-    'Brook Green': [r'\\bbrook\\s*green\\b'],
-    'Osso': [r'\\bosso\\b'],
-    'Volters': [r'\\bvolters?\\b'],
-    'F & S Energy': [r'\\bf\\s*(?:&|and)\\s*s\\s+energy\\b'],
-    'Conrad Energy': [r'\\bconrad\\s+energy\\b'],
-    'Marble': [r'\\bmarble\\s+(?:energy|power)\\b'],
-    'Yu Energy': [r'\\byu\\s+energy\\b'],
-    'UK Gas Supply': [r'\\buk\\s+gas\\s+supply\\b']
+    'British Gas': [r'\bbritish\s+gas\b',r'@britishgas\.co\.uk',r'\bBG\b'],
+    'SSE': [r'\bSSE\b',r'@sse\.com'],
+    'EDF': [r'\bEDF\b',r'@edfenergy\.com'],
+    'Npower': [r'\bnpower\b',r'@npower\.com'],
+    'Drax': [r'\bdrax\b'],
+    'SEFE': [r'\bsefe\b'],
+    'Shell': [r'\bshell\b'],
+    'Ecotricity': [r'\becotricity\b'],
+    'Crown': [r'\bcrown\s+(?:gas|energy)\b'],
+    'Dyce': [r'\bdyce\b'],
+    'UGP': [r'\bUGP\b',r'\butility\s+group\b'],
+    'TEM': [r'\btem[- ]energy\b'],
+    'TotalEnergies': [r'\btotal\s*energies\b'],
+    'E.ON Next': [r'\be\.?on\s+next\b'],
+    'Brook Green': [r'\bbrook\s*green\b'],
+    'Osso': [r'\bosso\b'],
+    'Volters': [r'\bvolters?\b'],
+    'F & S Energy': [r'\bf\s*(?:&|and)\s*s\s+energy\b'],
+    'Conrad Energy': [r'\bconrad\s+energy\b'],
+    'Marble': [r'\bmarble\s+(?:energy|power)\b'],
+    'Yu Energy': [r'\byu\s+energy\b'],
+    'UK Gas Supply': [r'\buk\s+gas\s+supply\b']
 }
-DECLINE_SIGNAL = re.compile(r'\\b(?:declin(?:e|ed|ing)|unable to (?:quote|offer|price)|cannot (?:quote|offer|price)|not (?:able to|in a position to) (?:quote|offer|price)|no quote|not quoting|will not (?:quote|offer|price)|unable to proceed|credit declined|outside our (?:risk|credit) appetite|not competitive)\\b',re.I)
+DECLINE_SIGNAL = re.compile(r'\b(?:declin(?:e|ed|ing)|unable to (?:quote|offer|price)|cannot (?:quote|offer|price)|not (?:able to|in a position to) (?:quote|offer|price)|no quote|not quoting|will not (?:quote|offer|price)|unable to proceed|credit declined|outside our (?:risk|credit) appetite|not competitive)\b',re.I)
 
 def find_decline_suppliers(chunk):
     return [name for name,patterns in DECLINE_SUPPLIERS.items() if any(re.search(pattern,chunk,re.I) for pattern in patterns)]
@@ -276,7 +276,7 @@ def decline_suggestions(source, filename, sender=''):
         # A general statement like "SSE, EDF and Dyce declined" creates three proposals.
         for name in (names or ['']):
             reason=line[:600]
-            fuel='Gas' if re.search(r'\\bgas\\b',context,re.I) and not re.search(r'\\belectri(?:c|city)\\b',context,re.I) else 'Electricity'
+            fuel='Gas' if re.search(r'\bgas\b',context,re.I) and not re.search(r'\belectri(?:c|city)\b',context,re.I) else 'Electricity'
             suggestions.append({'Include':True,'Supplier':name,'Fuel':fuel,'Reason':reason,'Source':filename})
     if not suggestions:
         suggestions.append({'Include':True,'Supplier':sender_supplier[0] if len(sender_supplier)==1 else '', 'Fuel':'Electricity','Reason':'','Source':filename})
