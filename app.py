@@ -204,7 +204,33 @@ def save_supply(cid, d):
 
 def pdf_text(raw):
     reader = PdfReader(io.BytesIO(raw))
-    return '\n'.join(page.extract_text() or '' for page in reader.pages[:35])
+    pages=[page.extract_text() or '' for page in reader.pages[:80]]
+    # Supplier offer packs frequently contain several contracts, each with a
+    # pricing schedule plus numerous terms pages. Feed the pricing schedules
+    # and their contract periods to AI, not generic terms and variable tariffs.
+    schedules=[]
+    period=None
+    agreement=None
+    for index, page in enumerate(pages):
+        period_match=re.search(r'Contract Period\s+(\d+)\s+Months?',page,re.I)
+        if period_match:
+            period=int(period_match.group(1))
+        agreement_match=re.search(r'Agreement ID\s+(AGR\d+)',page,re.I)
+        if agreement_match:
+            agreement=agreement_match.group(1)
+        if ('Pricing and Site Schedule' in page or
+                'Non Half-Hourly Pricing and Site Schedule' in page):
+            fuel='Gas' if re.search(r'\bGas Pricing and Site Schedule\b',page,re.I) else 'Electricity'
+            schedules.append(
+                f'\n=== QUOTED PRICING SCHEDULE: {fuel}; '
+                f'TERM {period if period else "UNKNOWN"} MONTHS; '
+                f'AGREEMENT {agreement or "UNKNOWN"}; PDF PAGE {index+1} ===\n'
+                +page
+                +'\n=== END QUOTED SCHEDULE ===\n'
+            )
+    if schedules:
+        return '\n'.join(schedules)
+    return '\n'.join(pages)
 
 def extract_offer_text(fname, raw):
     name = fname.lower()
@@ -223,6 +249,9 @@ def extract_offer_text(fname, raw):
             filename=part.get_filename() or ''
             try:
                 if filename.lower().endswith(('.pdf','.txt','.csv','.xlsx','.xls')):
+                    # LOAs and direct-debit mandates are not pricing evidence.
+                    if re.search(r'(letter.of.authority|\bloa\b|direct.?debit|mandate)',filename,re.I):
+                        continue
                     data=part.get_payload(decode=True)
                     parts.append(f'\nATTACHMENT {filename}:\n'+extract_offer_text(filename,data))
                 elif ctype=='text/plain' and not filename:
@@ -343,6 +372,10 @@ def ai_offer_review_rows(rawtext, supplies, supplier_hint, source):
     instructions=(
         'Extract supplier energy quotations from the provided email/document text into JSON. '
         'Return a JSON object with an offers array; one entry PER ACTUAL quoted meter PER contract term. '
+        'For supplier PDF schedules, trust sections marked QUOTED PRICING SCHEDULE and TERM, not dates in email requests. ' +
+        'For SSE Protect PDF schedules, the Primary Tariff Rate is the quoted single unit rate, Standing Charge is p/day, ' +
+        'and DD Discount is a separate conditional discount: do not subtract it again from already discounted unit rates. ' +
+        'Do not invent day/night or kVA rates when the schedule has only a primary rate. ' +
         'Do not fabricate cross-products of meters and terms. Only return meter/term pairs '
         'that are supported by the provided text. '
         'All rates are RAW supplier quotes before uplift. Return numeric rates in pence units: '
