@@ -335,6 +335,57 @@ def guess_details(s):
     }
     return {'meters':meters,'terms':terms, **{k:first_number(v,s) for k,v in patterns.items()}}
 
+def ai_offer_review_rows(rawtext, supplies, supplier_hint, source):
+    """AI-assisted extraction. Never save unreviewed data or invent missing values."""
+    from openai import OpenAI
+    client=OpenAI(api_key=os.environ['OPENAI_API_KEY'],timeout=65.0,max_retries=1)
+    meters=[{'meter':str(x['meter']),'fuel':x['fuel']} for x in supplies]
+    instructions=(
+        'Extract supplier energy quotations from the provided email/document text into JSON. '
+        'Return a JSON object with an offers array; one entry PER ACTUAL quoted meter PER contract term. '
+        'Do not fabricate cross-products of meters and terms. Only return meter/term pairs '
+        'that are supported by the provided text. '
+        'All rates are RAW supplier quotes before uplift. Return numeric rates in pence units: '
+        'day_rate_p_kwh, night_rate_p_kwh (null for single rate), standing_p_day, '
+        'kva_rate_p_kva_day. Convert pounds/day to pence/day and monthly charges to daily '
+        'using 365/12 days per month; capacity monthly charge per kVA to p/kVA/day. '
+        'Treat null as unavailable; never use 0 for unknown. '
+        'Do not confuse usage, kVA, totals or other quoted terms with unit rates. '
+        'Each offer must include meter (13-digit MPAN bottom line or numeric MPRN), '
+        'fuel (Electricity or Gas), supplier, term_months, day_rate_p_kwh, '
+        'night_rate_p_kwh, standing_p_day, kva_rate_p_kva_day, evidence. '
+        'Meter must match one of the client meters below. '
+        'If unable to match a meter confidently omit that offer. '
+        'Extract only quoted terms, not hypothetical terms. '
+        'Output strictly JSON with key offers, and optionally warnings.'
+    )
+    message=json.dumps({'supplier_hint':supplier_hint,'source_file':source,
+                        'client_meters':meters,'document_text':rawtext[:130000]},ensure_ascii=False)
+    response=client.chat.completions.create(
+        model=os.environ.get('AU_AI_MODEL','gpt-4.1-mini'),
+        temperature=0,
+        response_format={'type':'json_object'},
+        messages=[{'role':'system','content':instructions},{'role':'user','content':message}]
+    )
+    parsed=json.loads(response.choices[0].message.content or '{}')
+    available={(str(x['meter']),x['fuel']) for x in supplies}
+    results=[]
+    for o in parsed.get('offers',[]):
+        meter=normalise_meter(o.get('meter'))
+        fuel=str(o.get('fuel') or '')
+        if (meter,fuel) not in available:continue
+        term=num(o.get('term_months'))
+        if term is None or term<1 or term>120 or int(term)!=term:continue
+        results.append({'Save':True,'MPAN / MPRN':meter,'Fuel':fuel,
+            'Supplier':str(o.get('supplier') or supplier_hint or '').strip(),
+            'Term (months)':int(term),
+            'Day rate p/kWh':num(o.get('day_rate_p_kwh')),
+            'Night rate p/kWh':num(o.get('night_rate_p_kwh')),
+            'Standing p/day':num(o.get('standing_p_day')),
+            'kVA rate p/kVA/day':num(o.get('kva_rate_p_kva_day')),
+            'Source':source})
+    return results,parsed.get('warnings',[])
+
 def offer_review_rows(rawtext, supplies, supplier, source):
     """Review every identified meter x term; only attach rates in the matching section."""
     lines=[x.strip() for x in rawtext.splitlines() if x.strip()]
@@ -673,7 +724,24 @@ with tabs[2]:
             if matching:ordered=matching+[sid for sid in ordered if sid not in matching]
             if rawtext:
                 st.markdown('#### Review all meters and contract terms together')
-                batch=offer_review_rows(rawtext,supplies,supplier_guess,filename)
+                if os.environ.get('OPENAI_API_KEY'):
+                    st.caption('AI quotation extraction: click Analyze to create editable rows. This uses your separately billed OpenAI API.')
+                    if st.button('✨ Analyze document with AI',key=f'analyze_{cid}_{filename}'):
+                        try:
+                            with st.spinner('Reading meter-by-meter quotation prices...'):
+                                batch_rows,ai_warnings=ai_offer_review_rows(rawtext,supplies,supplier_guess,filename)
+                            st.session_state['ai_offer_result']={'client':cid,'source':filename,'rows':batch_rows,'warnings':ai_warnings}
+                        except Exception as ex:
+                            st.error(f'AI extraction failed: {type(ex).__name__}. Please check your API key, billing and document format.')
+                    stored=st.session_state.get('ai_offer_result',{})
+                    if stored.get('client')==cid and stored.get('source')==filename:
+                        batch=stored.get('rows',[])
+                        for warning in stored.get('warnings',[]):st.warning(str(warning))
+                    else:
+                        batch=[]
+                else:
+                    st.warning('AI extraction is not configured. Using basic text matching instead.')
+                    batch=offer_review_rows(rawtext,supplies,supplier_guess,filename)
                 if batch:
                     st.caption('Each detected MPAN/MPRN is paired with each detected term. Review ALL rates carefully; blanks mean the meter/term rate could not be reliably assigned. Existing offers are never overwritten.')
                     edited_offers=st.data_editor(pd.DataFrame(batch),hide_index=True,use_container_width=True,
