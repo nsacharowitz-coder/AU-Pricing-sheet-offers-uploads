@@ -360,6 +360,25 @@ def export_file(client,supplies,offers,declines,supplier_terms):
             up=client['elec_uplift'] if s['fuel']=='Electricity' else client['gas_uplift']
             cost=offer_cost(o,s,client)
             allrows.append({'Fuel':s['fuel'],'Site':s['site'],'MPAN / MPRN':s['meter'],'Supplier':o['supplier'],'Term (months)':o['term'],'Annual day kWh':s['day_usage'],'Annual night kWh':s['night_usage'],'kVA':s['kva'],'Quoted day / single p/kWh':o['day_rate'],'Quoted night p/kWh':o['night_rate'],'Uplift p/kWh':up,'Applied day / single p/kWh':None if o['day_rate'] is None else round(o['day_rate']+up,6),'Applied night p/kWh':None if o['night_rate'] is None else round(o['night_rate']+up,6),'Standing p/day':o['standing'],'kVA rate p/kVA/day':o['kva_rate'],'Other annual £':o['other_annual'],'Annual cost £':cost,'Rank':None,'Top 3':None,'Quote date':o['quote_date'],'Start date':o['start_date'],'End date':o['end_date'],'Notes':o['notes']})
+        # Show each meter for every standard term, even when no quotation has been saved.
+        # Additional quoted terms (e.g. 48/60 months) are included automatically.
+        covered={(r['Fuel'],r['MPAN / MPRN'],r['Term (months)']) for r in allrows}
+        for supply in supplies:
+            for months in (12,24,36):
+                key=(supply['fuel'],supply['meter'],months)
+                if key in covered:
+                    continue
+                allrows.append({'Fuel':supply['fuel'],'Site':supply['site'],
+                    'MPAN / MPRN':supply['meter'],'Supplier':'NO SAVED OFFER',
+                    'Term (months)':months,'Annual day kWh':supply['day_usage'],
+                    'Annual night kWh':supply['night_usage'],'kVA':supply['kva'],
+                    'Quoted day / single p/kWh':None,'Quoted night p/kWh':None,
+                    'Uplift p/kWh':None,'Applied day / single p/kWh':None,
+                    'Applied night p/kWh':None,'Standing p/day':None,
+                    'kVA rate p/kVA/day':None,'Other annual £':None,
+                    'Annual cost £':None,'Rank':None,'Top 3':None,
+                    'Quote date':None,'Start date':None,'End date':None,
+                    'Notes':'No quotation has been saved for this meter and term.'})
         for fuel in ('Electricity','Gas'):
             rows=[r for r in allrows if r['Fuel']==fuel]
             keys=set((r['MPAN / MPRN'],r['Term (months)']) for r in rows)
@@ -375,6 +394,12 @@ def export_file(client,supplies,offers,declines,supplier_terms):
             if rows:
                 ws.conditional_format(1,17,len(rows),17,{'type':'3_color_scale'})
                 ws.conditional_format(1,18,len(rows),18,{'type':'text','criteria':'containing','value':'YES','format':book.add_format({'bg_color':'#D8F0DF','font_color':'#186738','bold':True})})
+        declinecols=['Supplier','Fuel','Reason / notes','Recorded']
+        declinerows=[{'Supplier':d.get('supplier'),'Fuel':d.get('fuel'),
+            'Reason / notes':d.get('reason'),'Recorded':d.get('updated')} for d in declines]
+        decline_ws=tab('Declined Suppliers',declinerows,declinecols)
+        decline_ws.set_column(0,0,25)
+        decline_ws.set_column(2,2,90)
         termcols=['Supplier','Fuel','Generator matching','Volume tolerance','Take-or-pay / minimum volume','Pass-through charges','Termination / exit conditions','Payment terms','Credit requirements','Quote validity','Other contractual terms','Source / reference','Updated']
         termrows=[{'Supplier':t.get('supplier'),'Fuel':t.get('fuel'),'Generator matching':t.get('generator_matching'),'Volume tolerance':t.get('volume_tolerance'),'Take-or-pay / minimum volume':t.get('take_or_pay'),'Pass-through charges':t.get('pass_through'),'Termination / exit conditions':t.get('termination'),'Payment terms':t.get('payment_terms'),'Credit requirements':t.get('credit_requirements'),'Quote validity':t.get('quote_validity'),'Other contractual terms':t.get('other_terms'),'Source / reference':t.get('source'),'Updated':t.get('updated')} for t in supplier_terms]
         ws=tab('Supplier Terms',termrows,termcols)
@@ -529,6 +554,7 @@ with tabs[2]:
     if client:
         if not supplies:st.warning('First add a current supply/MPAN under Current Rates so quotes can be linked to the correct meter.')
         else:
+            st.warning('Uploading a quotation does NOT save its rates automatically. Review and click Save / replace offer for each MPAN/MPRN and each contract term (12, 24, 36 months etc.).')
             st.caption('Accepted: PDF, EML (including supported attachments), TXT, CSV and XLSX. Extracted values must be verified before saving.')
             method=st.radio('Input method',['Upload supplier quotation','Paste offer text','Manual entry'],horizontal=True)
             rawtext=''
@@ -707,4 +733,4 @@ with tabs[5]:
         supplier_terms=fetch('SELECT * FROM supplier_terms WHERE client_id=? ORDER BY supplier,fuel',(cid,))
         result=export_file(client,supplies,offers,declines,supplier_terms)
         st.download_button('⬇ Download comparison Excel',result,file_name=f"{re.sub('[^A-Za-z0-9]+','_',client['name'])}_Offers_Comparison.xlsx",mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
-        st.caption('Four tabs: Current Rates, Electricity Offers, Gas Offers, Supplier Terms. Supplier terms must be entered and verified; declines remain available in the app.')
+        st.caption('Five tabs: Current Rates, Electricity Offers, Gas Offers, Declined Suppliers, Supplier Terms. All meters appear under 12/24/36 months even if an offer has not yet been saved.')
