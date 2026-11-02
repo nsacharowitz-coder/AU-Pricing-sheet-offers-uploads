@@ -82,7 +82,7 @@ def hdr(s):
     return re.sub(r'[^a-z0-9]+','',str(s).lower())
 
 SYN = {
-    'meter': ['mpanbottomline','mpan','mprn','mpr','pxn','supplynumber','meterreference','meterid'],
+    'meter': ['mpanbottomline','mpanbottom','mpan13digit','mpan13digits','mpannumber','mpannum','mpanmprn','mpanormprn','mpanmp rn','electricitympan','mprnnumber','gas mprn','mprnumber','mpan','mprn','mpr','pxn','supplynumber','meterreference','meterid'],
     'site': ['sitename','site','supplyaddress','address','customername'],
     'postcode': ['sitepostcode','postcode','post code'],
     'fuel': ['fuel','utility','type'],
@@ -106,21 +106,51 @@ def align_df(df):
         out[key] = df[candidate] if candidate is not None else None
     return out
 
+def normalise_meter(v):
+    """Keep meter IDs as text, including leading zeros; tolerate separators and Excel .0."""
+    raw = text(v)
+    if not raw: return ''
+    raw = re.sub(r'\.0+$', '', raw)
+    digits = re.sub(r'\D', '', raw)
+    return digits if 6 <= len(digits) <= 13 else ''
+
+def detect_header_row(df):
+    """Find the real header row when a spreadsheet starts with a report title."""
+    for i in range(min(18,len(df))):
+        labels={hdr(v) for v in df.iloc[i].values if text(v)}
+        if labels.intersection(set(SYN['meter'])):
+            columns=[text(x) if text(x) else f'Unnamed_{j}' for j,x in enumerate(df.iloc[i])]
+            found=df.iloc[i+1:].copy()
+            found.columns=columns
+            return found.reset_index(drop=True)
+    return None
+
+def usable_table(df):
+    matched={hdr(c) for c in df.columns}
+    if matched.intersection(SYN['meter']): return df
+    # If there is only one column, support MPANs listed one per line without a heading.
+    if len(df.columns)==1:
+        first=normalise_meter(df.columns[0]); values=[first]+[normalise_meter(v) for v in df.iloc[:,0]]
+        values=[v for v in values if v]
+        if values: return pd.DataFrame({'MPAN':values})
+    found=detect_header_row(pd.concat([pd.DataFrame([list(df.columns)],columns=df.columns),df],ignore_index=True))
+    return found if found is not None else df
+
 def uploaded_table(file):
     raw = file.getvalue()
     if file.name.lower().endswith('.csv'):
-        return pd.read_csv(io.BytesIO(raw), sep=None, engine='python', dtype=str)
-    return pd.read_excel(io.BytesIO(raw), dtype=str)
+        return usable_table(pd.read_csv(io.BytesIO(raw), sep=None, engine='python', dtype=str))
+    return usable_table(pd.read_excel(io.BytesIO(raw), dtype=str))
 
 def pasted_table(raw):
     sep = '\t' if '\t' in raw.splitlines()[0] else ','
-    return pd.read_csv(io.StringIO(raw), sep=sep, dtype=str)
+    return usable_table(pd.read_csv(io.StringIO(raw), sep=sep, dtype=str))
 
 def imported_supply_rows(df, default_fuel):
     result = []
     for _, row in align_df(df).iterrows():
         d = row.to_dict()
-        meter = re.sub(r'\D','',text(d['meter']))
+        meter = normalise_meter(d['meter'])
         if not meter or meter.lower() == 'nan': continue
         d['meter'] = meter
         d['fuel'] = 'Gas' if 'gas' in text(d.get('fuel') or default_fuel).lower() else 'Electricity'
@@ -369,7 +399,7 @@ with tabs[1]:
                 d['start_date']=c2.text_input('Contract start date (optional)')
                 d['end_date']=c3.text_input('Contract end date (optional)')
                 if st.form_submit_button('Save supply',type='primary'):
-                    d['meter']=re.sub(r'\D','',d['meter'])
+                    d['meter']=normalise_meter(d['meter'])
                     if d['meter']:save_supply(cid,d);st.success('Supply saved');st.rerun()
                     else:st.warning('MPAN/MPRN required')
         if df is not None:
@@ -381,7 +411,11 @@ with tabs[1]:
                 if st.button(f'Save {len(rows)} supply records',type='primary'):
                     for row in rows:save_supply(cid,row)
                     st.success('Current rates saved');st.rerun()
-            else:st.warning('No MPAN/MPRN recognised. Check the headings in your source.')
+            else:
+                st.warning('No valid MPAN/MPRN recognised. Please check the column heading and values below.')
+                st.caption('Accepted examples: MPAN, MPAN Bottom Line, MPAN Number, MPAN / MPRN, MPRN; or a single column of meter numbers.')
+                st.write('Detected column headings:', list(df.columns))
+                st.dataframe(df.head(5), use_container_width=True)
         st.divider()
         st.write('**Saved supplies**')
         if supplies:
