@@ -16,7 +16,7 @@ from pypdf import PdfReader
 
 DB = Path(os.environ.get('AU_DB_PATH', str(Path(__file__).with_name('au_offers.db'))))
 DB.parent.mkdir(parents=True, exist_ok=True)
-st.set_page_config(page_title='AU Offer Manager', page_icon='⚡', layout='wide')
+st.set_page_config(page_title='AU Offer Manager', page_icon='⚡', layout='wide', initial_sidebar_state='expanded')
 
 # Require a password before displaying any client information or accessing the database.
 # Set AU_APP_PASSWORD using your hosting provider's secret environment variables.
@@ -292,7 +292,7 @@ st.title('⚡ AU Client Offer Manager')
 st.caption('Client-by-client quotations • current rates • supplier uploads • adjustable uplift • Excel comparison')
 clients=fetch('SELECT * FROM clients ORDER BY name')
 if not clients:
-    st.info('Start by adding your first client below.')
+    st.warning('No clients are stored in this deployment. On Render free hosting, the local database can be reset after a restart or redeploy. Add a test client below. For permanent client records, configure persistent storage before using real client data.')
 
 tabs=st.tabs(['👥 Clients','📋 Current Rates','📨 Offers','📑 Supplier Terms','🚫 Declines','📊 Comparison & Export'])
 with tabs[0]:
@@ -349,7 +349,10 @@ with tabs[0]:
 # Keep the active client consistent across all other tabs.
 clients=fetch('SELECT * FROM clients ORDER BY name')
 if clients:
-    active_name=st.sidebar.selectbox('ACTIVE CLIENT', [x['name'] for x in clients],key='activeclient')
+    st.sidebar.header('👥 Your clients')
+    st.sidebar.caption(f'{len(clients)} client(s) currently saved')
+    active_name=st.selectbox('ACTIVE CLIENT — select a client here or use the sidebar', [x['name'] for x in clients],key='activeclient')
+    st.sidebar.info(f'Active client: {active_name}')
     client=next(x for x in clients if x['name']==active_name)
     cid=client['id']
     st.sidebar.success(active_name)
@@ -365,6 +368,7 @@ if clients:
     supplies=fetch('SELECT * FROM supplies WHERE client_id=? ORDER BY fuel,site,meter',(cid,))
     supply_labels={s['id']:f"{s['fuel']} | {s['meter']} | {s['site'] or '-'}" for s in supplies}
 else:
+    st.sidebar.warning('No saved clients. Open the Clients tab to add one. On a free Render deployment, records may be lost after redeployment.')
     client=None;cid=None;supplies=[];supply_labels={}
 
 with tabs[1]:
