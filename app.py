@@ -291,22 +291,31 @@ def decline_suggestions(source, filename, sender=''):
     return out
 
 def detect_offer_supplier(fname, raw=b'', body=''):
-    """Prefer original email sender; fall back to subject, then filename.
-    Never infer from quoted forwarded email bodies containing several suppliers.
-    """
+    """Identify a supplier from the email sender, forwarded sender, subject or filename."""
     candidates=[]
     if fname.lower().endswith('.eml') and raw:
         mail=BytesParser(policy=policy.default).parsebytes(raw)
         sender=str(mail.get('From',''))
-        # Forwarded emails may have an AU employee as sender; handle original From header.
+        candidates.append(sender)
         if not find_decline_suppliers(sender):
-            plain=body or ''
-            forwarded=re.search(r'(?im)^\s*From:\s*(.+)
+            forwarded=re.search(r'(?im)^\s*From:\s*(.+)$', body or '')
+            if forwarded:
+                candidates.append(forwarded.group(1))
+        candidates.append(str(mail.get('Subject','')))
+    candidates.append(fname)
+    for candidate in candidates:
+        matches=find_decline_suppliers(candidate)
+        if len(matches)==1:
+            return matches[0]
+    return ''
+
+def first_number(patterns, s):
     for p in patterns:
-        m = re.search(p,s,re.I)
+        m=re.search(p,s,re.I)
         if m:
             x=num(m.group(1))
-            if x is not None: return x
+            if x is not None:
+                return x
     return None
 
 def guess_details(s):
