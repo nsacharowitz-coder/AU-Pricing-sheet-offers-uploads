@@ -335,6 +335,50 @@ def guess_details(s):
     }
     return {'meters':meters,'terms':terms, **{k:first_number(v,s) for k,v in patterns.items()}}
 
+def offer_review_rows(rawtext, supplies, supplier, source):
+    """Propose one editable offer row per meter and term without reusing rates across terms."""
+    lines=[x.strip() for x in rawtext.splitlines() if x.strip()]
+    meter_map={str(item['meter']):item for item in supplies}
+    meters=[m for m in meter_map if m in re.sub(r'[ -]', '', rawtext)]
+    if not meters and len(meter_map)==1:
+        meters=list(meter_map)
+    term_pattern=re.compile(r'(?<!\d)(12|24|36|48|60)\s*(?:m(?:onths?|ths?)?|years?)\b', re.I)
+    proposals=[]
+    for meter in meters:
+        for i,line in enumerate(lines):
+            found=term_pattern.search(line)
+            if not found:continue
+            term=int(found.group(1))
+            if 'year' in found.group(0).lower():term*=12
+            # Only extract numbers when explicitly labelled; never silently copy
+            # one rate to several terms from an unrelated table section.
+            local=' '.join(lines[max(0,i-1):min(len(lines),i+3)])
+            meter_context= re.sub(r'\D','',local)
+            if len(meters)>1 and meter not in meter_context and meter not in re.sub(r'\D','',line):
+                continue
+            patterns={
+                'Day rate p/kWh': [r'(?:day|single|unit)\s*(?:rate)?\s*[:=]\s*(\d+(?:\.\d+)?)'],
+                'Night rate p/kWh': [r'night\s*(?:rate)?\s*[:=]\s*(\d+(?:\.\d+)?)'],
+                'Standing p/day': [r'standing\s*(?:charge)?\s*[:=]\s*(\d+(?:\.\d+)?)'],
+                'kVA rate p/kVA/day': [r'(?:kva|capacity)\s*rate\s*[:=]\s*(\d+(?:\.\d+)?)']
+            }
+            values={k: first_number(pats,local) for k,pats in patterns.items()}
+            proposals.append({'Save':True,'MPAN / MPRN':meter,'Supplier':supplier,
+                'Term (months)':term,**values,'Source':source})
+    # If the email has no parseable table, still give the user an editable row
+    # for each detected term and meter; no invented rates.
+    if not proposals:
+        detected=guess_details(rawtext)
+        for meter in meters:
+            for term in detected['terms']:
+                proposals.append({'Save':True,'MPAN / MPRN':meter,'Supplier':supplier,
+                    'Term (months)':term,'Day rate p/kWh':None,'Night rate p/kWh':None,
+                    'Standing p/day':None,'kVA rate p/kVA/day':None,'Source':source})
+    unique={}
+    for x in proposals:
+        unique[(x['MPAN / MPRN'],x['Term (months)'])]=x
+    return list(unique.values())
+
 def offer_cost(o, sup, client):
     day=num(sup.get('day_usage'))
     night=num(sup.get('night_usage')) or 0
@@ -577,7 +621,7 @@ with tabs[2]:
     if client:
         if not supplies:st.warning('First add a current supply/MPAN under Current Rates so quotes can be linked to the correct meter.')
         else:
-            st.warning('Uploading a quotation does NOT save its rates automatically. Review and click Save / replace offer for each MPAN/MPRN and each contract term (12, 24, 36 months etc.).')
+            st.info('Upload, review all extracted contract terms in the editable table, then save selected NEW offers. Existing offers are preserved.')
             st.caption('Accepted: PDF, EML (including supported attachments), TXT, CSV and XLSX. Extracted values must be verified before saving.')
             method=st.radio('Input method',['Upload supplier quotation','Paste offer text','Manual entry'],horizontal=True)
             rawtext=''
@@ -615,6 +659,45 @@ with tabs[2]:
             ordered=list(supply_labels)
             matching=[sid for sid in ordered if str(next(x['meter'] for x in supplies if x['id']==sid)) in guess['meters']]
             if matching:ordered=matching+[sid for sid in ordered if sid not in matching]
+            if rawtext:
+                st.markdown('#### Review multiple contract terms together')
+                batch=offer_review_rows(rawtext,supplies,supplier_guess,filename)
+                if batch:
+                    st.caption('These are proposed rows, not confirmed prices. Edit every rate from the source quotation. Empty rates have NOT been inferred. Existing offers are never overwritten by this import.')
+                    edited_offers=st.data_editor(pd.DataFrame(batch),hide_index=True,use_container_width=True,
+                        num_rows='dynamic',key=f'offer_batch_editor_{cid}_{filename}',
+                        column_config={'Save':st.column_config.CheckboxColumn('Save',default=True)})
+                    if st.button('Save selected new offers — skip existing',type='primary',key='offer_batch_save'):
+                        existing={(x['supply_id'],x['supplier'].strip().lower(),int(x['term'])) for x in fetch('SELECT * FROM offers WHERE client_id=?',(cid,))}
+                        supply_for_meter={str(x['meter']):x for x in supplies}
+                        added=skipped=invalid=0
+                        for _,item in edited_offers.iterrows():
+                            if not item.get('Save',True):continue
+                            meter=str(item.get('MPAN / MPRN','')).strip()
+                            matched=supply_for_meter.get(meter)
+                            name=str(item.get('Supplier') or '').strip()
+                            months=num(item.get('Term (months)'))
+                            dayrate=num(item.get('Day rate p/kWh'))
+                            nightrate=num(item.get('Night rate p/kWh'))
+                            standingrate=num(item.get('Standing p/day'))
+                            kvarate=num(item.get('kVA rate p/kVA/day'))
+                            if not matched or not name or months is None or not 1<=months<=120 or int(months)!=months or dayrate is None or dayrate<=0:
+                                invalid+=1
+                                continue
+                            key=(matched['id'],name.lower(),int(months))
+                            if key in existing:
+                                skipped+=1
+                                continue
+                            execute('''INSERT INTO offers(client_id,supply_id,supplier,term,day_rate,night_rate,standing,kva_rate,other_annual,quote_date,source,notes)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(client_id,supply_id,supplier,term) DO NOTHING''',
+                            (cid,matched['id'],name,int(months),dayrate,nightrate,standingrate,kvarate,0,datetime.today().date().isoformat(),filename,'Reviewed batch import'))
+                            existing.add(key)
+                            added+=1
+                        st.success(f'Added {added} new offer(s). Skipped {skipped} existing offer(s).')
+                        if invalid:st.warning(f'{invalid} row(s) need a valid meter, supplier, term and day/single rate.')
+                else:
+                    st.info('No matching meter and term pairs detected. You can enter the offers manually below.')
+            st.markdown('#### Add a single offer manually')
             with st.form('offer_entry'):
                 c1,c2,c3=st.columns(3)
                 chosen=c1.selectbox('Supply / MPAN / MPRN *',ordered,format_func=lambda i:supply_labels[i])
@@ -634,14 +717,14 @@ with tabs[2]:
                 notes=c.text_input('Notes / exclusions')
                 st.info(f'Saving a {term}-month offer. Offers for a different term will remain saved separately for this MPAN/MPRN and supplier.')
                 st.info(f"Client uplift applied automatically to calculations: electricity **{client['elec_uplift']}p/kWh**, gas **{client['gas_uplift']}p/kWh**. Enter raw supplier rates without uplift.")
-                if st.form_submit_button('Save / replace offer',type='primary'):
+                if st.form_submit_button('Save new offer (do not replace)',type='primary'):
                     if not supplier.strip() or day<=0:st.error('Supply, supplier and a positive day/single rate are required.')
                     elif night.strip() and num(night) is None:st.error('Night rate must be numeric or blank.')
                     else:
                         execute('''INSERT INTO offers(client_id,supply_id,supplier,term,day_rate,night_rate,standing,kva_rate,other_annual,start_date,end_date,quote_date,source,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                        ON CONFLICT(client_id,supply_id,supplier,term) DO UPDATE SET day_rate=excluded.day_rate,night_rate=excluded.night_rate,standing=excluded.standing,kva_rate=excluded.kva_rate,other_annual=excluded.other_annual,start_date=excluded.start_date,end_date=excluded.end_date,quote_date=excluded.quote_date,source=excluded.source,notes=excluded.notes,updated=CURRENT_TIMESTAMP''',
+                        ON CONFLICT(client_id,supply_id,supplier,term) DO NOTHING''',
                         (cid,chosen,supplier.strip(),int(term),day,num(night),standing,kva,other,start,end,qdate,filename,notes))
-                        st.success(f'Saved {supplier} {term}-month offer. Other contract terms for this supplier and meter remain unchanged.')
+                        st.success(f'Save requested for {supplier} {term}-month offer. Existing entries are preserved.')
             offers=fetch('SELECT * FROM offers WHERE client_id=? ORDER BY term,supplier',(cid,))
             if offers:
                 st.divider();st.write('**Saved offers**')
