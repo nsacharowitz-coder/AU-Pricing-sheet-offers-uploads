@@ -336,48 +336,60 @@ def guess_details(s):
     return {'meters':meters,'terms':terms, **{k:first_number(v,s) for k,v in patterns.items()}}
 
 def offer_review_rows(rawtext, supplies, supplier, source):
-    """Propose one editable offer row per meter and term without reusing rates across terms."""
+    """Review every identified meter x term; only attach rates in the matching section."""
     lines=[x.strip() for x in rawtext.splitlines() if x.strip()]
     meter_map={str(item['meter']):item for item in supplies}
-    meters=[m for m in meter_map if m in re.sub(r'[ -]', '', rawtext)]
-    if not meters and len(meter_map)==1:
-        meters=list(meter_map)
-    term_pattern=re.compile(r'(?<!\d)(12|24|36|48|60)\s*(?:m(?:onths?|ths?)?|years?)\b', re.I)
+    compact=lambda value: re.sub(r'[\s-]', '', value)
+    # Detect saved meters even when MPANs are written with spaces or dashes.
+    meter_hits={}
+    for i,line in enumerate(lines):
+        collapsed=compact(line)
+        for meter in meter_map:
+            if meter in collapsed:
+                meter_hits.setdefault(meter,[]).append(i)
+    if not meter_hits and len(meter_map)==1:
+        meter_hits={next(iter(meter_map)): [0]}
+    term_re=re.compile(r'(?<!\d)(12|24|36|48|60)\s*(?:m(?:onths?|ths?)?|years?|yrs?)\b',re.I)
+    occurrences=[]
+    for i,line in enumerate(lines):
+        for match in term_re.finditer(line):
+            t=int(match.group(1))
+            if 'year' in match.group(0).lower() or 'yr' in match.group(0).lower():
+                t*=12
+            occurrences.append((i,t))
+    terms=sorted(set(t for _,t in occurrences))
     proposals=[]
-    for meter in meters:
-        for i,line in enumerate(lines):
-            found=term_pattern.search(line)
-            if not found:continue
-            term=int(found.group(1))
-            if 'year' in found.group(0).lower():term*=12
-            # Only extract numbers when explicitly labelled; never silently copy
-            # one rate to several terms from an unrelated table section.
-            local=' '.join(lines[max(0,i-1):min(len(lines),i+3)])
-            meter_context= re.sub(r'\D','',local)
-            if len(meters)>1 and meter not in meter_context and meter not in re.sub(r'\D','',line):
-                continue
-            patterns={
-                'Day rate p/kWh': [r'(?:day|single|unit)\s*(?:rate)?\s*[:=]\s*(\d+(?:\.\d+)?)'],
-                'Night rate p/kWh': [r'night\s*(?:rate)?\s*[:=]\s*(\d+(?:\.\d+)?)'],
-                'Standing p/day': [r'standing\s*(?:charge)?\s*[:=]\s*(\d+(?:\.\d+)?)'],
-                'kVA rate p/kVA/day': [r'(?:kva|capacity)\s*rate\s*[:=]\s*(\d+(?:\.\d+)?)']
-            }
-            values={k: first_number(pats,local) for k,pats in patterns.items()}
-            proposals.append({'Save':True,'MPAN / MPRN':meter,'Supplier':supplier,
-                'Term (months)':term,**values,'Source':source})
-    # If the email has no parseable table, still give the user an editable row
-    # for each detected term and meter; no invented rates.
-    if not proposals:
-        detected=guess_details(rawtext)
-        for meter in meters:
-            for term in detected['terms']:
-                proposals.append({'Save':True,'MPAN / MPRN':meter,'Supplier':supplier,
-                    'Term (months)':term,'Day rate p/kWh':None,'Night rate p/kWh':None,
-                    'Standing p/day':None,'kVA rate p/kVA/day':None,'Source':source})
-    unique={}
-    for x in proposals:
-        unique[(x['MPAN / MPRN'],x['Term (months)'])]=x
-    return list(unique.values())
+    field_patterns={
+        'Day rate p/kWh': [r'\b(?:day|single|unit)\s*(?:unit\s*)?rate\s*[:=|]?\s*(\d+(?:\.\d+)?)'],
+        'Night rate p/kWh': [r'\bnight\s*(?:unit\s*)?rate\s*[:=|]?\s*(\d+(?:\.\d+)?)'],
+        'Standing p/day': [r'\bstanding\s*(?:charge)?\s*[:=|]?\s*(\d+(?:\.\d+)?)'],
+        'kVA rate p/kVA/day': [r'\b(?:kva|capacity)\s*rate\s*[:=|]?\s*(\d+(?:\.\d+)?)']
+    }
+    for meter,hits in meter_hits.items():
+        for term in terms:
+            # Find the most relevant section containing both meter and term.
+            candidates=[]
+            for mi in hits:
+                for ti,tt in occurrences:
+                    if tt!=term:continue
+                    distance=abs(mi-ti)
+                    if distance<=8:
+                        candidates.append((distance,mi,ti))
+            values={field:None for field in field_patterns}
+            if candidates:
+                _,mi,ti=min(candidates)
+                lo,hi=min(mi,ti),max(mi,ti)
+                section=' '.join(lines[lo:min(len(lines),hi+3)])
+                # Do not borrow rates if this section also references other meters
+                # or other contract terms before the rates.
+                others=[m for m in meter_hits if m!=meter and m in compact(section)]
+                other_terms=[t for match_line,t in occurrences if t!=term and lo<=match_line<=hi+2]
+                if not others and not other_terms:
+                    values={field:first_number(patterns,section) for field,patterns in field_patterns.items()}
+            proposals.append({'Save':True,'MPAN / MPRN':meter,
+                'Fuel':meter_map[meter]['fuel'],'Supplier':supplier,'Term (months)':term,
+                **values,'Source':source})
+    return proposals
 
 def offer_cost(o, sup, client):
     day=num(sup.get('day_usage'))
@@ -660,21 +672,21 @@ with tabs[2]:
             matching=[sid for sid in ordered if str(next(x['meter'] for x in supplies if x['id']==sid)) in guess['meters']]
             if matching:ordered=matching+[sid for sid in ordered if sid not in matching]
             if rawtext:
-                st.markdown('#### Review multiple contract terms together')
+                st.markdown('#### Review all meters and contract terms together')
                 batch=offer_review_rows(rawtext,supplies,supplier_guess,filename)
                 if batch:
-                    st.caption('These are proposed rows, not confirmed prices. Edit every rate from the source quotation. Empty rates have NOT been inferred. Existing offers are never overwritten by this import.')
+                    st.caption('Each detected MPAN/MPRN is paired with each detected term. Review ALL rates carefully; blanks mean the meter/term rate could not be reliably assigned. Existing offers are never overwritten.')
                     edited_offers=st.data_editor(pd.DataFrame(batch),hide_index=True,use_container_width=True,
                         num_rows='dynamic',key=f'offer_batch_editor_{cid}_{filename}',
                         column_config={'Save':st.column_config.CheckboxColumn('Save',default=True)})
                     if st.button('Save selected new offers — skip existing',type='primary',key='offer_batch_save'):
                         existing={(x['supply_id'],x['supplier'].strip().lower(),int(x['term'])) for x in fetch('SELECT * FROM offers WHERE client_id=?',(cid,))}
-                        supply_for_meter={str(x['meter']):x for x in supplies}
+                        supply_for_meter={(str(x['meter']),x['fuel']):x for x in supplies}
                         added=skipped=invalid=0
                         for _,item in edited_offers.iterrows():
                             if not item.get('Save',True):continue
                             meter=str(item.get('MPAN / MPRN','')).strip()
-                            matched=supply_for_meter.get(meter)
+                            matched=supply_for_meter.get((meter,str(item.get('Fuel') or 'Electricity')))
                             name=str(item.get('Supplier') or '').strip()
                             months=num(item.get('Term (months)'))
                             dayrate=num(item.get('Day rate p/kWh'))
