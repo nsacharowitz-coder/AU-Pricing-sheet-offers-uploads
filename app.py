@@ -5,6 +5,8 @@ import io
 import json
 import re
 import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 from datetime import datetime
 from email import policy
 from email.parser import BytesParser
@@ -53,9 +55,43 @@ CREATE TABLE IF NOT EXISTS declines (id INTEGER PRIMARY KEY, client_id INTEGER N
 CREATE TABLE IF NOT EXISTS supplier_terms (id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL, supplier TEXT NOT NULL, fuel TEXT NOT NULL DEFAULT 'Both', generator_matching TEXT, volume_tolerance TEXT, take_or_pay TEXT, pass_through TEXT, termination TEXT, payment_terms TEXT, credit_requirements TEXT, quote_validity TEXT, other_terms TEXT, source TEXT, updated TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(client_id,supplier,fuel));
 '''
 
+# DATABASE_URL enables durable PostgreSQL (e.g. Supabase). SQLite is only for local demos.
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = 'postgresql://' + DATABASE_URL[len('postgres://'):]
+
+class PostgresConnection:
+    def __init__(self):
+        self.db = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=12)
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type:
+                self.db.rollback()
+            else:
+                self.db.commit()
+        finally:
+            self.db.close()
+    def executescript(self, script):
+        # Convert SQLite's auto-increment primary keys and case-insensitive collation.
+        schema = script.replace('INTEGER PRIMARY KEY', 'BIGSERIAL PRIMARY KEY').replace(' UNIQUE COLLATE NOCASE', ' UNIQUE')
+        for statement in schema.split(';'):
+            if statement.strip():
+                self.db.execute(statement)
+    def execute(self, sql, args=()):
+        # All application SQL uses positional ? placeholders.
+        return self.db.execute(sql.replace('?', '%s'), tuple(args))
+    def commit(self):
+        self.db.commit()
+
 def conn():
-    db = sqlite3.connect(DB)
-    db.row_factory = sqlite3.Row
+    if DATABASE_URL:
+        db = PostgresConnection()
+    else:
+        local = sqlite3.connect(DB)
+        local.row_factory = sqlite3.Row
+        db = local
     db.executescript(CREATE)
     return db
 
@@ -196,6 +232,64 @@ def extract_offer_text(fname, raw):
         return '\n'.join(parts)
     return ''
 
+# Decline extraction suggests supplier names; the operator can review/edit before saving.
+DECLINE_SUPPLIERS = {
+    'British Gas': [r'\\bbritish\\s+gas\\b',r'@britishgas\\.co\\.uk',r'\\bBG\\b'],
+    'SSE': [r'\\bSSE\\b',r'@sse\\.com'],
+    'EDF': [r'\\bEDF\\b',r'@edfenergy\\.com'],
+    'Npower': [r'\\bnpower\\b',r'@npower\\.com'],
+    'Drax': [r'\\bdrax\\b'],
+    'SEFE': [r'\\bsefe\\b'],
+    'Shell': [r'\\bshell\\b'],
+    'Ecotricity': [r'\\becotricity\\b'],
+    'Crown': [r'\\bcrown\\s+(?:gas|energy)\\b'],
+    'Dyce': [r'\\bdyce\\b'],
+    'UGP': [r'\\bUGP\\b',r'\\butility\\s+group\\b'],
+    'TEM': [r'\\btem[- ]energy\\b'],
+    'TotalEnergies': [r'\\btotal\\s*energies\\b'],
+    'E.ON Next': [r'\\be\\.?on\\s+next\\b'],
+    'Brook Green': [r'\\bbrook\\s*green\\b'],
+    'Osso': [r'\\bosso\\b'],
+    'Volters': [r'\\bvolters?\\b'],
+    'F & S Energy': [r'\\bf\\s*(?:&|and)\\s*s\\s+energy\\b'],
+    'Conrad Energy': [r'\\bconrad\\s+energy\\b'],
+    'Marble': [r'\\bmarble\\s+(?:energy|power)\\b'],
+    'Yu Energy': [r'\\byu\\s+energy\\b'],
+    'UK Gas Supply': [r'\\buk\\s+gas\\s+supply\\b']
+}
+DECLINE_SIGNAL = re.compile(r'\\b(?:declin(?:e|ed|ing)|unable to (?:quote|offer|price)|cannot (?:quote|offer|price)|not (?:able to|in a position to) (?:quote|offer|price)|no quote|not quoting|will not (?:quote|offer|price)|unable to proceed|credit declined|outside our (?:risk|credit) appetite|not competitive)\\b',re.I)
+
+def find_decline_suppliers(chunk):
+    return [name for name,patterns in DECLINE_SUPPLIERS.items() if any(re.search(pattern,chunk,re.I) for pattern in patterns)]
+
+def decline_suggestions(source, filename, sender=''):
+    lines=[line.strip() for line in (source or '').splitlines() if line.strip()]
+    # Extract named suppliers near decline statements, or from the sender if unique.
+    suggestions=[]
+    sender_supplier=find_decline_suppliers(sender)
+    for i,line in enumerate(lines):
+        if not DECLINE_SIGNAL.search(line):continue
+        context=' '.join(lines[max(0,i-2):min(len(lines),i+3)])
+        names=find_decline_suppliers(context)
+        if not names and len(sender_supplier)==1:
+            names=sender_supplier
+        # A general statement like "SSE, EDF and Dyce declined" creates three proposals.
+        for name in (names or ['']):
+            reason=line[:600]
+            fuel='Gas' if re.search(r'\\bgas\\b',context,re.I) and not re.search(r'\\belectri(?:c|city)\\b',context,re.I) else 'Electricity'
+            suggestions.append({'Include':True,'Supplier':name,'Fuel':fuel,'Reason':reason,'Source':filename})
+    if not suggestions:
+        suggestions.append({'Include':True,'Supplier':sender_supplier[0] if len(sender_supplier)==1 else '', 'Fuel':'Electricity','Reason':'','Source':filename})
+    # Remove exact duplicates while retaining multiple independent decline reasons.
+    out=[]
+    seen=set()
+    for row in suggestions:
+        key=(row['Supplier'],row['Fuel'],row['Reason'],row['Source'])
+        if key not in seen:
+            out.append(row)
+            seen.add(key)
+    return out
+
 def first_number(patterns, s):
     for p in patterns:
         m = re.search(p,s,re.I)
@@ -291,6 +385,10 @@ def export_file(client,supplies,offers,declines,supplier_terms):
 st.title('⚡ AU Client Offer Manager')
 st.caption('Client-by-client quotations • current rates • supplier uploads • adjustable uplift • Excel comparison')
 clients=fetch('SELECT * FROM clients ORDER BY name')
+if not DATABASE_URL:
+    st.error('⚠ Temporary test database: client records can disappear after a Render restart. Set DATABASE_URL to a hosted PostgreSQL connection string before relying on saved data.')
+else:
+    st.caption('✅ Persistent PostgreSQL database is configured.')
 if not clients:
     st.warning('No clients are stored in this deployment. On Render free hosting, the local database can be reset after a restart or redeploy. Add a test client below. For permanent client records, configure persistent storage before using real client data.')
 
@@ -307,7 +405,7 @@ with tabs[0]:
                 try:
                     execute('INSERT INTO clients(name,elec_uplift,gas_uplift) VALUES(?,?,?)',(n.strip(),e,g))
                     st.success(f'Added {n.strip()}');st.rerun()
-                except sqlite3.IntegrityError: st.error('A client with that name already exists.')
+                except (sqlite3.IntegrityError, psycopg.errors.UniqueViolation): st.error('A client with that name already exists.')
             else:st.warning('Please enter a name.')
     st.markdown('**Or upload a list of new clients**')
     bulk=st.file_uploader('Client list (.csv or .xlsx). Include a Name column; optional Electricity Uplift and Gas Uplift columns.',type=['csv','xlsx'],key='bulkupload')
@@ -329,7 +427,7 @@ with tabs[0]:
                         try:
                             execute('INSERT INTO clients(name,elec_uplift,gas_uplift) VALUES(?,?,?)',(name,num(r[ecol]) if ecol else 0,num(r[gcol]) if gcol else 0))
                             count+=1
-                        except sqlite3.IntegrityError:pass
+                        except (sqlite3.IntegrityError, psycopg.errors.UniqueViolation):pass
                     st.success(f'Created {count} new client(s); existing clients were left unchanged.')
                     st.rerun()
         except Exception as ex:st.error(f'Cannot read client list: {ex}')
@@ -533,49 +631,58 @@ with tabs[4]:
     st.subheader('Declined supplier log')
     if client:
         decline_method=st.radio('Add a decline',['Drag and drop / upload','Paste decline','Manual entry'],horizontal=True,key='decline_method')
-        decline_source=''
-        decline_text=''
+        review_rows=[]
         if decline_method=='Drag and drop / upload':
-            decline_files=st.file_uploader(
-                'Drag and drop declined-offer emails or documents here, or click Browse files',
-                type=['eml','pdf','txt','csv','xlsx','xls'],
-                accept_multiple_files=True,
-                key='decline_files',
-                help='Upload several supplier declines; review and record each one separately.'
-            )
-            if decline_files:
-                st.success(f'{len(decline_files)} decline document(s) uploaded for review.')
-                decline_index=st.selectbox('Decline to review',range(len(decline_files)),format_func=lambda i:decline_files[i].name,key='decline_file_choice')
-                decline_file=decline_files[decline_index]
-                decline_source=decline_file.name
+            decline_files=st.file_uploader('Drag and drop decline emails or documents (multiple suppliers supported)',type=['eml','pdf','txt','csv','xlsx','xls'],accept_multiple_files=True,key='decline_files')
+            for item in (decline_files or []):
                 try:
-                    decline_text=extract_offer_text(decline_file.name,decline_file.getvalue())
+                    raw=item.getvalue()
+                    sender=''
+                    if item.name.lower().endswith('.eml'):
+                        sender=str(BytesParser(policy=policy.default).parsebytes(raw).get('From',''))
+                    review_rows.extend(decline_suggestions(extract_offer_text(item.name,raw),item.name,sender))
                 except Exception as ex:
-                    st.error(f'Could not read this decline document: {ex}')
+                    st.error(f'Could not read {item.name}: {ex}')
         elif decline_method=='Paste decline':
-            decline_text=st.text_area('Paste the supplier decline email or message',height=180,key='decline_paste')
-            decline_source='Pasted decline'
-        if decline_text:
-            with st.expander('Review decline source text',expanded=True):
-                st.text_area('Extracted decline text',decline_text[:45000],height=190,key='decline_review_text')
-            st.caption('Check the supplier, fuel and reason before saving. Uploading does not automatically record a decline.')
-        with st.form('declined'):
-            c1,c2=st.columns(2)
-            supplier=c1.text_input('Supplier name *')
-            fuel=c2.selectbox('Fuel',['Electricity','Gas','Both'])
-            why=st.text_area('Reason / notes *',height=90,placeholder='Summarise the reason provided by the supplier')
-            if st.form_submit_button('Record decline',type='primary'):
-                if not supplier.strip():
-                    st.error('Enter the supplier name.')
-                elif not why.strip():
-                    st.error('Enter the reason for the decline.')
-                else:
-                    reason=why.strip()
-                    if decline_source:
-                        reason+=f' [Source: {decline_source}]'
-                    execute('INSERT INTO declines(client_id,supplier,fuel,reason) VALUES(?,?,?,?)',(cid,supplier.strip(),fuel,reason))
-                    st.success('Decline recorded for this client.')
+            raw_decline=st.text_area('Paste supplier decline email(s) here',height=180,key='decline_paste')
+            if raw_decline.strip():
+                review_rows=decline_suggestions(raw_decline,'Pasted decline')
+        if review_rows:
+            st.info('Supplier names, fuel and reasons below are suggestions extracted from the documents. Check and edit each row before saving. A blank supplier means the system could not identify it reliably.')
+            edited=st.data_editor(pd.DataFrame(review_rows),hide_index=True,use_container_width=True,key='decline_review_editor',
+                column_config={'Include':st.column_config.CheckboxColumn('Save?',default=True),
+                               'Fuel':st.column_config.SelectboxColumn('Fuel',options=['Electricity','Gas','Both'],required=True)},
+                num_rows='dynamic')
+            if st.button('Save reviewed supplier declines',type='primary'):
+                saved=0
+                incomplete=0
+                for _,row in edited.iterrows():
+                    if not row.get('Include',True):continue
+                    supplier=str(row.get('Supplier') or '').strip()
+                    reason=str(row.get('Reason') or '').strip()
+                    fuel=str(row.get('Fuel') or 'Electricity')
+                    source=str(row.get('Source') or '')
+                    if not supplier or not reason or fuel not in ['Electricity','Gas','Both']:
+                        incomplete+=1
+                        continue
+                    if source:reason+=f' [Source: {source}]'
+                    execute('INSERT INTO declines(client_id,supplier,fuel,reason) VALUES(?,?,?,?)',(cid,supplier,fuel,reason))
+                    saved+=1
+                if incomplete:st.warning(f'{incomplete} incomplete row(s) skipped; please fill in their supplier and reason.')
+                if saved:
+                    st.success(f'Saved {saved} reviewed supplier decline(s).')
                     st.rerun()
+        with st.expander('Enter a decline manually'):
+            with st.form('declined'):
+                c1,c2=st.columns(2)
+                supplier=c1.text_input('Supplier name')
+                fuel=c2.selectbox('Fuel',['Electricity','Gas','Both'])
+                why=st.text_area('Reason / notes',height=90)
+                if st.form_submit_button('Record decline'):
+                    if not supplier.strip() or not why.strip():st.error('Supplier and reason are required.')
+                    else:
+                        execute('INSERT INTO declines(client_id,supplier,fuel,reason) VALUES(?,?,?,?)',(cid,supplier.strip(),fuel,why.strip()))
+                        st.rerun()
         d=fetch('SELECT supplier,fuel,reason,updated FROM declines WHERE client_id=? ORDER BY updated DESC',(cid,))
         if d:st.dataframe(pd.DataFrame(d),hide_index=True,use_container_width=True)
 
