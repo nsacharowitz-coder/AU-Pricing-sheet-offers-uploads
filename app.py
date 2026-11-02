@@ -610,7 +610,9 @@ with tabs[2]:
                 c1,c2,c3=st.columns(3)
                 chosen=c1.selectbox('Supply / MPAN / MPRN *',ordered,format_func=lambda i:supply_labels[i])
                 supplier=c2.text_input('Supplier *',value=supplier_guess,placeholder='e.g. Npower',key='offer_supplier_input')
-                term=c3.number_input('Contract term (months) *',min_value=1,max_value=120,value=guess['terms'][0] if guess['terms'] else 24,step=1)
+                available_terms=sorted(set([12,24,36,48,60]+guess['terms']))
+                chosen_term=c3.selectbox('Contract term (months) — confirm before saving *',available_terms+['Other'],index=available_terms.index(guess['terms'][0]) if guess['terms'] and guess['terms'][0] in available_terms else 1,key=f'offer_term_choice_{cid}_{filename}')
+                term=c3.number_input('Custom term (months)',min_value=1,max_value=120,value=11,step=1,key=f'offer_custom_term_{cid}_{filename}') if chosen_term=='Other' else int(chosen_term)
                 a,b,c=st.columns(3)
                 day=a.number_input('Day / single unit rate (p/kWh) *',min_value=0.,value=float(guess['day_rate'] or 0.),format='%.6f')
                 night=b.text_input('Night rate (p/kWh) — blank for single',value=str(guess['night_rate']) if guess['night_rate'] is not None else '')
@@ -621,6 +623,7 @@ with tabs[2]:
                 start=a.text_input('Actual contract start (optional)')
                 end=b.text_input('Actual contract end (optional)')
                 notes=c.text_input('Notes / exclusions')
+                st.info(f'Saving a {term}-month offer. Offers for a different term will remain saved separately for this MPAN/MPRN and supplier.')
                 st.info(f"Client uplift applied automatically to calculations: electricity **{client['elec_uplift']}p/kWh**, gas **{client['gas_uplift']}p/kWh**. Enter raw supplier rates without uplift.")
                 if st.form_submit_button('Save / replace offer',type='primary'):
                     if not supplier.strip() or day<=0:st.error('Supply, supplier and a positive day/single rate are required.')
@@ -629,7 +632,7 @@ with tabs[2]:
                         execute('''INSERT INTO offers(client_id,supply_id,supplier,term,day_rate,night_rate,standing,kva_rate,other_annual,start_date,end_date,quote_date,source,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(client_id,supply_id,supplier,term) DO UPDATE SET day_rate=excluded.day_rate,night_rate=excluded.night_rate,standing=excluded.standing,kva_rate=excluded.kva_rate,other_annual=excluded.other_annual,start_date=excluded.start_date,end_date=excluded.end_date,quote_date=excluded.quote_date,source=excluded.source,notes=excluded.notes,updated=CURRENT_TIMESTAMP''',
                         (cid,chosen,supplier.strip(),int(term),day,num(night),standing,kva,other,start,end,qdate,filename,notes))
-                        st.success(f'Saved {supplier} {term}-month offer. Any previous offer for the same meter, supplier and term has been replaced.');st.rerun()
+                        st.success(f'Saved {supplier} {term}-month offer. Other contract terms for this supplier and meter remain unchanged.')
             offers=fetch('SELECT * FROM offers WHERE client_id=? ORDER BY term,supplier',(cid,))
             if offers:
                 st.divider();st.write('**Saved offers**')
