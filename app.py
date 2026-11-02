@@ -432,8 +432,17 @@ with tabs[2]:
             rawtext=''
             filename='Manual entry'
             if method=='Upload supplier quotation':
-                file=st.file_uploader('Upload supplier offer',type=['pdf','eml','txt','csv','xlsx','xls'],key='offerfile')
-                if file:
+                uploaded_files=st.file_uploader(
+                    'Drag and drop supplier quotations here, or click Browse files',
+                    type=['pdf','eml','txt','csv','xlsx','xls'],
+                    accept_multiple_files=True,
+                    key='offerfiles',
+                    help='Upload multiple quotations, then review and save each offer separately.'
+                )
+                if uploaded_files:
+                    st.success(f'{len(uploaded_files)} quotation file(s) ready for review.')
+                    selected_idx=st.selectbox('Quotation to review',range(len(uploaded_files)),format_func=lambda i: uploaded_files[i].name,key='selected_offer_upload')
+                    file=uploaded_files[selected_idx]
                     filename=file.name
                     try:rawtext=extract_offer_text(file.name,file.getvalue())
                     except Exception as ex:st.error(f'Could not read this quotation: {ex}')
@@ -519,13 +528,50 @@ with tabs[3]:
 with tabs[4]:
     st.subheader('Declined supplier log')
     if client:
+        decline_method=st.radio('Add a decline',['Drag and drop / upload','Paste decline','Manual entry'],horizontal=True,key='decline_method')
+        decline_source=''
+        decline_text=''
+        if decline_method=='Drag and drop / upload':
+            decline_files=st.file_uploader(
+                'Drag and drop declined-offer emails or documents here, or click Browse files',
+                type=['eml','pdf','txt','csv','xlsx','xls'],
+                accept_multiple_files=True,
+                key='decline_files',
+                help='Upload several supplier declines; review and record each one separately.'
+            )
+            if decline_files:
+                st.success(f'{len(decline_files)} decline document(s) uploaded for review.')
+                decline_index=st.selectbox('Decline to review',range(len(decline_files)),format_func=lambda i:decline_files[i].name,key='decline_file_choice')
+                decline_file=decline_files[decline_index]
+                decline_source=decline_file.name
+                try:
+                    decline_text=extract_offer_text(decline_file.name,decline_file.getvalue())
+                except Exception as ex:
+                    st.error(f'Could not read this decline document: {ex}')
+        elif decline_method=='Paste decline':
+            decline_text=st.text_area('Paste the supplier decline email or message',height=180,key='decline_paste')
+            decline_source='Pasted decline'
+        if decline_text:
+            with st.expander('Review decline source text',expanded=True):
+                st.text_area('Extracted decline text',decline_text[:45000],height=190,key='decline_review_text')
+            st.caption('Check the supplier, fuel and reason before saving. Uploading does not automatically record a decline.')
         with st.form('declined'):
             c1,c2=st.columns(2)
-            supplier=c1.text_input('Supplier name')
+            supplier=c1.text_input('Supplier name *')
             fuel=c2.selectbox('Fuel',['Electricity','Gas','Both'])
-            why=st.text_area('Reason / notes',height=90)
-            if st.form_submit_button('Record decline'):
-                if supplier.strip():execute('INSERT INTO declines(client_id,supplier,fuel,reason) VALUES(?,?,?,?)',(cid,supplier.strip(),fuel,why));st.success('Recorded');st.rerun()
+            why=st.text_area('Reason / notes *',height=90,placeholder='Summarise the reason provided by the supplier')
+            if st.form_submit_button('Record decline',type='primary'):
+                if not supplier.strip():
+                    st.error('Enter the supplier name.')
+                elif not why.strip():
+                    st.error('Enter the reason for the decline.')
+                else:
+                    reason=why.strip()
+                    if decline_source:
+                        reason+=f' [Source: {decline_source}]'
+                    execute('INSERT INTO declines(client_id,supplier,fuel,reason) VALUES(?,?,?,?)',(cid,supplier.strip(),fuel,reason))
+                    st.success('Decline recorded for this client.')
+                    st.rerun()
         d=fetch('SELECT supplier,fuel,reason,updated FROM declines WHERE client_id=? ORDER BY updated DESC',(cid,))
         if d:st.dataframe(pd.DataFrame(d),hide_index=True,use_container_width=True)
 
