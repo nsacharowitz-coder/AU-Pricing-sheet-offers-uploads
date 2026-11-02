@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: au-pricing-portal-test
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true --server.enableCORS true --server.enableXsrfProtection true
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: AU_APP_PASSWORD
+        sync: false
+      - key: AU_DB_PATH
+        value: /opt/render/project/src/au_offers.db
+      - key: PYTHON_VERSION
+        value: 3.11.11
